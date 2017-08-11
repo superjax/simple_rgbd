@@ -6,15 +6,8 @@
 #include <relative_nav/Keyframe.h>
 #include <relative_nav/Match.h>
 #include <map>
-
-#include <gtsam/geometry/Point2.h>
-#include <gtsam/inference/Symbol.h>
-#include <gtsam/slam/PriorFactor.h>
-#include <gtsam/slam/ProjectionFactor.h>
-#include <gtsam/slam/BetweenFactor.h>
-#include <gtsam/nonlinear/NonlinearFactorGraph.h>
-#include <gtsam/nonlinear/DoglegOptimizer.h>
-#include <gtsam/nonlinear/Values.h>
+#include <eigen3/Eigen/Core>
+#include <eigen3/Eigen/Geometry>
 
 namespace simple_rgbd
 {
@@ -34,17 +27,18 @@ public:
   void match_callback(const relative_nav::MatchConstPtr &msg);
   void kf_callback(const relative_nav::KeyframeConstPtr &msg);
 
+ Eigen::Matrix4d ransac(double num_iterations, Eigen::MatrixXd src_3d_points, Eigen::MatrixXd dst_3d_points);
+ Eigen::Vector3d find_centroid(std::vector<Eigen::Vector3d> points);
+
   std::map <std::string, std::vector<cv::Mat>> keyframes;
 
   cv::rgbd::RgbdOdometry odom_;
   cv::Ptr<cv::FeatureDetector> detector_;
   cv::Ptr<cv::DescriptorMatcher> matcher_;
 
-  gtsam::Cal3_S2 K_;
-  // Define the camera observation noise model
-  gtsam::noiseModel::Isotropic::shared_ptr pixelNoise_;
-
   double match_ratio_;
+
+  cv::Mat camera_matrix_, distortion_coefficients_;
 };
 
 }

@@ -1,7 +1,6 @@
 #include "simple_rgbd/simple_rgbd.h"
 
 using namespace cv;
-using namespace gtsam;
 
 namespace simple_rgbd
 {
@@ -18,14 +17,8 @@ RGBD_Odom::RGBD_Odom() :
   std::string filename = "/home/superjax/xtion_1/ost.yaml";
   ROS_INFO("opening %s", filename.c_str());
   FileStorage fs(filename, FileStorage::READ);
-  Mat camera_matrix, distortion_coefficients;
-  fs["camera_matrix"] >> camera_matrix;
-  fs["distortion_coefficients"] >> distortion_coefficients;
-
-  K_ = Cal3_S2(camera_matrix.at<double>(0,0), camera_matrix.at<double>(1,1),
-               camera_matrix.at<double>(0,1), camera_matrix.at<double>(0,2),
-               camera_matrix.at<double>(1,2));
-  pixelNoise_ = noiseModel::Isotropic::Sigma(2, 1.0); // one pixel in u and v
+  fs["camera_matrix"] >> camera_matrix_;
+  fs["distortion_coefficients"] >> distortion_coefficients_;
 
   std::vector<int> iterCounts(4);
   iterCounts[0] = 7;
@@ -40,11 +33,11 @@ RGBD_Odom::RGBD_Odom() :
   minGradMagnitudes[3] = 1;
 
   // Configure the odometry
-  odom_.setCameraMatrix(camera_matrix);
-  odom_.setTransformType(rgbd::ICPOdometry::RIGID_BODY_MOTION);
+//  odom_.setCameraMatrix(camera_matrix_);
+//  odom_.setTransformType(rgbd::ICPOdometry::RIGID_BODY_MOTION);
   //  odom_.setMaxDepth(4.0f);
   //  odom_.setMinDepth(0.0f);
-  odom_.setMaxDepthDiff(0.5f);
+//  odom_.setMaxDepthDiff(0.5f);
   //  odom_.setMaxTranslation(0.15);
   //  odom_.setMaxRotation(15);
   //  odom_.setMinGradientMagnitudes(Mat(minGradMagnitudes));
@@ -114,113 +107,226 @@ void RGBD_Odom::match_callback(const relative_nav::MatchConstPtr &msg)
     imshow("matches", matched_img);
     waitKey(1);
 
-    // Use GTSAM to find transform between images
-    NonlinearFactorGraph graph;
-    Values initialEstimate;
+    std::vector<KeyPoint> src_kp_undistorted, dst_kp_undistorted;
+    undistortPoints(src_keypoints, src_kp_undistorted, camera_matrix_, distortion_coefficients_);
+    undistortPoints(dst_keypoints, dst_kp_undistorted, camera_matrix_, distortion_coefficients_);
 
-    // Add a prior on pose x1. This indirectly specifies where the origin is.
-    Rot3 Identity(1, 0, 0, 0, 1, 0, 0, 0, 1);
-    Pose3 origin(Identity, Point3(0, 0, 0));
-    noiseModel::Diagonal::shared_ptr srcNoise = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(0.001), Vector3::Constant(0.001)).finished()); // 30cm std on x,y,z 0.1 rad on roll,pitch,yaw
-    graph.emplace_shared<PriorFactor<Pose3> >(Symbol('x', 0), origin, srcNoise); // add directly to graph
-    initialEstimate.insert(Symbol('x', 0), origin);
-
-    // Add a prior for the dst location
-    noiseModel::Diagonal::shared_ptr dstNoise = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(0.5), Vector3::Constant(0.2)).finished()); // 50cm std on x,y,z 0.2 rad on roll,pitch,yaw
-    graph.emplace_shared<PriorFactor<Pose3> >(Symbol('x', 1), origin, dstNoise); // add directly to graph
-    initialEstimate.insert(Symbol('x', 1), origin);
-
-
-    // Add measurements
-    SimpleCamera camera(origin, K_);
-    noiseModel::Isotropic::shared_ptr pointNoise = noiseModel::Isotropic::Sigma(3, 0.1);
+    // Set up the ponts for RANSAC
+    std::vector<Point3d> src_points_3d, dst_points_3d;
+    src_points_3d.resize(good_matches.size(), 3);
+    dst_points_3d.resize(good_matches.size(), 3);
+    double cx = camera_matrix_.at<double>(0, 2);
+    double cy = camera_matrix_.at<double>(1, 2);
+    double fx = camera_matrix_.at<double>(0, 0);
+    double fy = camera_matrix_.at<double>(1, 1);
     for (int i = 0; i < good_matches.size(); i++)
     {
-      KeyPoint src_kp = src_keypoints[good_matches[i].queryIdx];
-      Point2 src_point(src_kp.pt.x, src_kp.pt.y);
-      double src_depth_kp = src_depth.at<double>(src_kp.pt);
-      Pose3 src_landmark = camera.backproject(src_point, src_depth_kp);
+      // Back project this point into the 3d space
+      double u = src_kp_undistorted[good_matches[i].queryIdx].pt.x;
+      double v = src_kp_undistorted[good_matches[i].queryIdx].pt.y;
+      double z = src_depth.at<double>(u,v);
 
-      // Put in a prior and measurement for this landmark
-      graph.emplace_shared<PriorFactor<Point3>>(Symbol('l',i), src_landmark, pointNoise);
-      graph.emplace_shared<BetweenFactor<Pose3, Point3>>(Symbol('x', 0), Symbol('l', i), src_landmark, pointNoise);
-      initialEstimate.insert(Symbol('l', i), src_landmark);
+      src_points_3d(i, 0) = (u - cx)*z/fx;
+      src_points_3d(i, 1) = (v - cy)*z/fy;
+      src_points_3d(i, 2) = z;
 
-      KeyPoint dst_kp = dst_keypoints[good_matches[i].queryIdx];
-      Point2 dst_point(dst_kp.pt.x, dst_kp.pt.y);
-      double dst_depth_kp = dst_depth.at<double>(dst_kp.pt);
-      Pose3 dst_landmark(Identity, camera.backproject(dst_point, dst_depth_kp));
+      u = dst_kp_undistorted[good_matches[i].queryIdx].pt.x;
+      v = dst_kp_undistorted[good_matches[i].queryIdx].pt.y;
+      z = dst_depth.at<double>(u,v);
 
-      // Add the measurement from the second image
-      graph.emplace_shared<BetweenFactor<Point3>>(Symbol('x', 1), Symbol('l', i), dst_landmark, pointNoise);
+      dst_points_3d(i, 0) = (u - cx)*z/fx;
+      dst_points_3d(i, 1) = (v - cy)*z/fy;
+      dst_points_3d(i, 2) = z;
     }
 
-    // Optimize
-    Values result = DoglegOptimizer(graph, initialEstimate).optimize();
-    result.print("Final Result:\n");
+    // Run RANSAC
+    Mat R, T;
+    int inliers;
+    std::vector<int> inlier_list;
+    Mat current_other;
+    ransac(100, Mat(src_points_3d), Mat(dst_points_3d), R, T, inliers, inlier_list, current_other);
 
-    ROS_INFO_STREAM("initial error = " << graph.error(initialEstimate));
-    ROS_INFO_STREAM("final error = " << graph.error(result));
+
+  }
+}
+
+void  RGBD_Odom::ransac(const int num_iterations,
+                        const cv::Mat &reference,
+                        const cv::Mat &current,
+                        cv::Mat &final_solution_1,
+                        cv::Mat &final_solution_2,
+                        int *inliers,
+                        std::vector<int> *inlier_list,
+                        cv::Mat &current_other)
+{
+  //check dimensions:
+  ROS_ASSERT(reference.rows == current.rows);
+  ROS_ASSERT(reference.rows > 3);  //need more than three matching features
+
+  double best_total_error = 99999999999999999999.9; //something high...
+  int best_size = 3; //keeping track of most inliers
+  std::vector<double> best_errors; //best vector showing the error
+  std::vector<int> best_inliers; //initialize to three numbers...
+  best_inliers.push_back(1);
+  best_inliers.push_back(2);
+  best_inliers.push_back(3);
+
+  //containers for the best solution:
+  cv::Mat best_sol_1;
+  cv::Mat best_sol_2;
+
+  //main loop for RANSAC:
+  #pragma omp parallel for shared( best_total_error, best_size) //,best_errors,best_sol_1,best_sol_2
+  for(int i = 0; i < num_iterations; i++)
+  {
+    //containers for the solution at each iteration
+    cv::Mat solution_1;
+    cv::Mat solution_2;
+    std::vector<double> error_temp;  //container for the error
+    std::vector<int> inliers_temp;   //container for the inliers
+    double temp_err; //sum of the error at each iteration
+
+    cv::Mat reference_sample,current_sample,cur_2d_sample; //the container for reference & current samples
+    reference_sample = cv::Mat();
+    current_sample = cv::Mat();
+    cur_2d_sample = cv::Mat();
+
+    std::vector<int> list;
+
+    //sample
+    list = ransac_model_->randomSample(min_sample_,0,(reference.rows-1));
+
+    //load the samples in
+    for(size_t i = 0; i< list.size(); i++)
+    {
+      reference_sample.push_back(reference.row(list[i]));
+      current_sample.push_back(current.row(list[i]));
+      if(ransac_type_ == R_3PT) //Add other pertinent 3pt algorithm names here
+      {
+        cur_2d_sample.push_back(current_other.row(list[i]));
+      }
+    }
+
+    //find a solution using the sampled points
+    if(ransac_model_->sampleSolution(reference_sample,current_sample,solution_1,solution_2))
+    {
+      //check the error against all the points
+      if(ransac_type_ == R_3PT)
+      {
+        //3D points need 3D reference and 2D current
+        temp_err = ransac_model_->computeError(reference,current_other,solution_1,error_temp,inliers_temp,solution_2);
+      }
+      else
+      {
+        temp_err = ransac_model_->computeError(reference,current,solution_1,error_temp,inliers_temp,solution_2);
+      }
+    }
+    else
+    {
+      continue;
+    }
+
+    #pragma omp critical
+    if((temp_err < best_total_error && (int)inliers_temp.size() >= best_size) || (int)inliers_temp.size() > best_size)
+    {
+      //check to see if it is the best so far or better than our minimum threshold
+      //two conditions, (better error and same or greater # inliers) OR (greater # inliers)
+
+      //Have an improved guess, replace with new information:
+      best_size = (int)inliers_temp.size();
+      best_total_error = temp_err;
+      best_errors = error_temp;
+      best_inliers = inliers_temp;
+      best_sol_1 = solution_1.clone();
+      best_sol_2 = solution_2.clone();
+      /// Exit Criteria: ( \attention NOT VALID WHILE USING OMP TO PARALLELIZE LOOP!)
+      /// p = 1 - (1-ratio^N)^M, where N is sample size, M is the current iteration we are on, ratio is the
+      /// best inlier ratio so far.  Typical cutoff values for p are 0.99 or 0.999
+    }
+  }//End of main loop
+
+  if(best_sol_1.empty())
+  {
+    //ROS_ERROR("No inliers found in the RANSAC Portion!!");
+    return;
   }
 
+  //For using all the inliers to generate a least squares solution:
+  cv::Mat best_reference, best_current;
+  for(int i = 0; i < (int)best_inliers.size(); i++)
+  {
+    best_reference.push_back(reference.row(best_inliers[i]));
+    best_current.push_back(current.row(best_inliers[i]));
+  }
 
+  if(ransac_type_ != R_3PT)
+  {
+    //Extract the projection matrix:
+    RANSAC8pt *ransac_2d = (RANSAC8pt*)ransac_model_; //cast to get to the trianglePoint function
+    ransac_2d->computePfromE(best_sol_1,best_reference,best_current,best_sol_2);
 
+//    std::cout << "Best Essential Matrix:" <<std::endl;
+//    std::cout << best_sol_1 << std::endl;
+//    std::cout << "Best Projection Matrix:" <<std::endl;
+//    std::cout << best_sol_2 << std::endl;
 
-
-
-
-//  for(unsigned i = 0; i < matches.size(); i++)
-//  {
-//    if(matches[i][0].distance < 0.3* matches[i][1].distance)
+    cv::Mat final_1, final_2; //matricies from the SVD;
+    bool valid;
+//    if(best_inliers.size() > (size_t)8)
 //    {
-//      src_matched.push_back(src_keypoints[matches[i][0].queryIdx]);
-//      dst_matched.push_back(dst_keypoints[matches[i][0].trainIdx]);
-//      filtered_matches.push_back(matches[i]);
+//      valid = ransac_model_->sampleSolution(best_reference,best_current,final_1,final_2);
+//      ransac_2d->computePfromE(final_1,best_reference,best_current,final_2);
 //    }
-//  }
+//    else
+      valid = false;
 
-//  if ((double)src_matched.size()/(double)src_keypoints.size() > 0.1)
-//  {
-//    ROS_INFO("found sufficiently matched features: %f", (double)src_matched.size()/(double)matches.size());
-//    Mat matched_img;
-
-
-//  }
-//  else
-//  {
-//    ROS_INFO("insufficient matches, %f", (double)src_matched.size()/(double)src_keypoints.size());
-//  }
+//    std::cout << "Combined 1 Essential Matrix:" <<std::endl;
+//    std::cout << final_1 << std::endl;
+//    std::cout << "Combined 1 Projection Matrix:" <<std::endl;
+//    std::cout << final_2 << std::endl;
 
 
+    if(valid)
+    {
+      //use the least squares solution:
+      final_1.copyTo(final_solution_1);
+      final_2.copyTo(final_solution_2);
+    }
+    else
+    {
+      //use the RANSAC solution:
+      best_sol_1.copyTo(final_solution_1);
+      best_sol_2.copyTo(final_solution_2);
+    }
+  }
+  else
+  {
+    //use the 3pt solution:
+    best_sol_1.copyTo(final_solution_1);
+    best_sol_2.copyTo(final_solution_2);
+  }
 
-//  // Perform visual odometry to get transform
-//  Mat mask(src_rgb.rows, src_rgb.cols, CV_8UC1);
+  *inliers = (int)best_inliers.size(); //report # inliers
+  *inlier_list = best_inliers;
 
-//  Mat T;
-//  if (odom_.compute(src_rgb, src_depth, mask, dst_rgb, dst_depth, mask, T))
-//  {
-//    Mat R = Mat(T, Rect(0, 0, 3, 3));
-//    Mat tran = Mat(T, Rect(3, 0, 1, 3));
-//    ROS_WARN_STREAM("computed T = \n" << T);
-//    ROS_INFO_STREAM("rotation R = \n" << R);
-//    ROS_INFO_STREAM("translation = \n" << tran);
-//    ROS_INFO_STREAM("\n\n");
-
-//    if (show_matches_)
-//    {
-//      imshow("from", keyframes[from_id][0]);
-//      imshow("to", keyframes[to_id][0]);
-//      waitKey(2);
-//    }
-//  }
-//  else
-//  {
-//    ROS_INFO_STREAM("No transform computed, T = \n" << T);
-//  }
-
-
-
+  //ROS_INFO_THROTTLE(1,"RANSAC Inliers = %d", *inliers); //advertise the # of inliers
 }
+
+
+Eigen::Vector3d RGBD_Odom::find_centroid(std::vector<Eigen::Vector3d> points)
+{
+  Eigen::Vector3d sum;
+  sum.setZero();
+
+  for (int i = 0; i < points.size(); i++)
+  {
+    sum += points[i];
+  }
+
+  Eigen::Vector3d mean = sum/(double)points.size();
+  return mean;
+}
+
 
 
 }

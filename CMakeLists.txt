@@ -15,7 +15,6 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
 )
 find_package(OpenCV 3 REQUIRED)
-find_package(GTSAM REQUIRED)
 find_package(Eigen3)
 
 
@@ -29,7 +28,6 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-  ${GTSAM_INCLUDE_DIR}
 )
 
 
@@ -41,7 +39,6 @@ add_executable(simple_rgbd
 target_link_libraries(simple_rgbd
   ${OpenCV_LIBRARIES}
   ${catkin_LIBRARIES}
-  gtsam
 )
 
 add_dependencies(simple_rgbd
